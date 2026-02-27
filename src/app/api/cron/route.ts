@@ -1,6 +1,5 @@
 /* eslint-disable no-console,@typescript-eslint/no-explicit-any */
 
-import * as crypto from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 
 import { getConfig, refineConfig } from '@/lib/config';
@@ -145,21 +144,21 @@ async function refreshRecordAndFavorites() {
     };
 
     // 并发限制工具
-    async function runWithConcurrency<T>(
+    const runWithConcurrency = async <T>(
       tasks: (() => Promise<T>)[],
       concurrency: number
-    ): Promise<T[]> {
+    ): Promise<T[]> => {
       const results: T[] = [];
       let index = 0;
-      async function worker() {
+      const worker = async () => {
         while (index < tasks.length) {
           const i = index++;
           results[i] = await tasks[i]();
         }
-      }
+      };
       await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
       return results;
-    }
+    };
 
     // 处理单个用户的播放记录和收藏
     const processUser = async (user: string) => {
