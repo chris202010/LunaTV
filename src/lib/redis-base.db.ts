@@ -253,6 +253,8 @@ export abstract class BaseRedisStorage implements IStorage {
   async registerUser(userName: string, password: string): Promise<void> {
     // 简单存储明文密码，生产环境应加密
     await this.withRetry(() => this.client.set(this.userPwdKey(userName), password));
+    // 维护用户集合
+    await this.withRetry(() => this.client.sAdd(this.usersSetKey(), userName));
   }
 
   async verifyUser(userName: string, password: string): Promise<boolean> {
@@ -286,6 +288,9 @@ export abstract class BaseRedisStorage implements IStorage {
     // 删除用户密码
     await this.withRetry(() => this.client.del(this.userPwdKey(userName)));
 
+    // 从用户集合中移除
+    await this.withRetry(() => this.client.sRem(this.usersSetKey(), userName));
+
     // 删除搜索历史
     await this.withRetry(() => this.client.del(this.shKey(userName)));
 
@@ -295,14 +300,8 @@ export abstract class BaseRedisStorage implements IStorage {
     // 删除收藏夹（Hash key 直接删除）
     await this.withRetry(() => this.client.del(this.favHashKey(userName)));
 
-    // 删除跳过片头片尾配置
-    const skipConfigPattern = `u:${userName}:skip:*`;
-    const skipConfigKeys = await this.withRetry(() =>
-      this.client.keys(skipConfigPattern)
-    );
-    if (skipConfigKeys.length > 0) {
-      await this.withRetry(() => this.client.del(skipConfigKeys));
-    }
+    // 删除跳过片头片尾配置（Hash key 直接删除）
+    await this.withRetry(() => this.client.del(this.skipHashKey(userName)));
   }
 
   // ---------- 搜索历史 ----------
@@ -338,14 +337,13 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   // ---------- 获取全部用户 ----------
+  private usersSetKey() {
+    return 'sys:users';
+  }
+
   async getAllUsers(): Promise<string[]> {
-    const keys = await this.withRetry(() => this.client.keys('u:*:pwd'));
-    return keys
-      .map((k) => {
-        const match = k.match(/^u:(.+?):pwd$/);
-        return match ? ensureString(match[1]) : undefined;
-      })
-      .filter((u): u is string => typeof u === 'string');
+    const members = await this.withRetry(() => this.client.sMembers(this.usersSetKey()));
+    return ensureStringArray(members as any[]);
   }
 
   // ---------- 管理员配置 ----------
@@ -365,8 +363,12 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   // ---------- 跳过片头片尾配置 ----------
-  private skipConfigKey(user: string, source: string, id: string) {
-    return `u:${user}:skip:${source}+${id}`;
+  private skipHashKey(user: string) {
+    return `u:${user}:skip`; // 一个用户的所有跳过配置存在一个 Hash 中
+  }
+
+  private skipField(source: string, id: string) {
+    return `${source}+${id}`;
   }
 
   async getSkipConfig(
@@ -375,7 +377,7 @@ export abstract class BaseRedisStorage implements IStorage {
     id: string
   ): Promise<SkipConfig | null> {
     const val = await this.withRetry(() =>
-      this.client.get(this.skipConfigKey(userName, source, id))
+      this.client.hGet(this.skipHashKey(userName), this.skipField(source, id))
     );
     return val ? (JSON.parse(val) as SkipConfig) : null;
   }
@@ -387,8 +389,9 @@ export abstract class BaseRedisStorage implements IStorage {
     config: SkipConfig
   ): Promise<void> {
     await this.withRetry(() =>
-      this.client.set(
-        this.skipConfigKey(userName, source, id),
+      this.client.hSet(
+        this.skipHashKey(userName),
+        this.skipField(source, id),
         JSON.stringify(config)
       )
     );
@@ -400,43 +403,28 @@ export abstract class BaseRedisStorage implements IStorage {
     id: string
   ): Promise<void> {
     await this.withRetry(() =>
-      this.client.del(this.skipConfigKey(userName, source, id))
+      this.client.hDel(this.skipHashKey(userName), this.skipField(source, id))
     );
   }
 
   async getAllSkipConfigs(
     userName: string
   ): Promise<{ [key: string]: SkipConfig }> {
-    const pattern = `u:${userName}:skip:*`;
-    const keys = await this.withRetry(() => this.client.keys(pattern));
-
-    if (keys.length === 0) {
-      return {};
-    }
-
+    const all = await this.withRetry(() =>
+      this.client.hGetAll(this.skipHashKey(userName))
+    );
     const configs: { [key: string]: SkipConfig } = {};
-
-    // 批量获取所有配置
-    const values = await this.withRetry(() => this.client.mGet(keys));
-
-    keys.forEach((key, index) => {
-      const value = values[index];
-      if (value) {
-        // 从key中提取source+id
-        const match = key.match(/^u:.+?:skip:(.+)$/);
-        if (match) {
-          const sourceAndId = match[1];
-          configs[sourceAndId] = JSON.parse(value as string) as SkipConfig;
-        }
+    for (const [field, raw] of Object.entries(all)) {
+      if (raw) {
+        configs[field] = JSON.parse(raw) as SkipConfig;
       }
-    });
-
+    }
     return configs;
   }
 
   // ---------- 数据迁移：旧扁平 key → Hash 结构 ----------
   private migrationKey() {
-    return 'sys:migration:hash_v1';
+    return 'sys:migration:hash_v2';
   }
 
   async migrateData(): Promise<void> {
@@ -450,7 +438,6 @@ export abstract class BaseRedisStorage implements IStorage {
       // 迁移播放记录：u:*:pr:* → u:username:pr (Hash)
       const prKeys = await this.withRetry(() => this.client.keys('u:*:pr:*'));
       if (prKeys.length > 0) {
-        // 过滤掉新 Hash key（没有第四段的就是 Hash key 本身）
         const oldPrKeys = prKeys.filter((k) => {
           const parts = k.split(':');
           return parts.length >= 4 && parts[2] === 'pr' && parts[3] !== '';
@@ -468,7 +455,6 @@ export abstract class BaseRedisStorage implements IStorage {
               this.client.hSet(this.prHashKey(userName), field, raw)
             );
           }
-          // 删除旧 key
           await this.withRetry(() => this.client.del(oldPrKeys));
           console.log(`迁移了 ${oldPrKeys.length} 条播放记录`);
         }
@@ -494,9 +480,49 @@ export abstract class BaseRedisStorage implements IStorage {
               this.client.hSet(this.favHashKey(userName), field, raw)
             );
           }
-          // 删除旧 key
           await this.withRetry(() => this.client.del(oldFavKeys));
           console.log(`迁移了 ${oldFavKeys.length} 条收藏`);
+        }
+      }
+
+      // 迁移 skipConfig：u:*:skip:* → u:username:skip (Hash)
+      const skipKeys = await this.withRetry(() => this.client.keys('u:*:skip:*'));
+      if (skipKeys.length > 0) {
+        const oldSkipKeys = skipKeys.filter((k) => {
+          const parts = k.split(':');
+          return parts.length >= 4 && parts[2] === 'skip' && parts[3] !== '';
+        });
+
+        if (oldSkipKeys.length > 0) {
+          const values = await this.withRetry(() => this.client.mGet(oldSkipKeys));
+          for (let i = 0; i < oldSkipKeys.length; i++) {
+            const raw = values[i];
+            if (!raw) continue;
+            const match = oldSkipKeys[i].match(/^u:(.+?):skip:(.+)$/);
+            if (!match) continue;
+            const [, userName, field] = match;
+            await this.withRetry(() =>
+              this.client.hSet(this.skipHashKey(userName), field, raw)
+            );
+          }
+          await this.withRetry(() => this.client.del(oldSkipKeys));
+          console.log(`迁移了 ${oldSkipKeys.length} 条跳过配置`);
+        }
+      }
+
+      // 迁移用户列表：从 KEYS u:*:pwd 构建 sys:users Set
+      const userSetExists = await this.withRetry(() => this.client.exists(this.usersSetKey()));
+      if (!userSetExists) {
+        const pwdKeys = await this.withRetry(() => this.client.keys('u:*:pwd'));
+        const userNames = pwdKeys
+          .map((k) => {
+            const match = k.match(/^u:(.+?):pwd$/);
+            return match ? match[1] : undefined;
+          })
+          .filter((u): u is string => typeof u === 'string');
+        if (userNames.length > 0) {
+          await this.withRetry(() => this.client.sAdd(this.usersSetKey(), userNames));
+          console.log(`迁移了 ${userNames.length} 个用户到 Set`);
         }
       }
 
@@ -505,7 +531,6 @@ export abstract class BaseRedisStorage implements IStorage {
       console.log('数据迁移完成');
     } catch (error) {
       console.error('数据迁移失败:', error);
-      // 不抛出异常，允许服务继续运行
     }
   }
 
