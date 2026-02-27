@@ -86,6 +86,9 @@ export interface IStorage {
   // 数据迁移（旧扁平 key → Hash 结构）
   migrateData?(): Promise<void>;
 
+  // 密码迁移（明文 → 加盐哈希）
+  migratePasswords?(): Promise<void>;
+
   // 数据清理相关
   clearAllData(): Promise<void>;
 }

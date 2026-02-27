@@ -3,6 +3,7 @@
 import { Redis } from '@upstash/redis';
 
 import { AdminConfig } from './admin.types';
+import { hashPassword, isHashed, verifyPassword } from './password';
 import { Favorite, IStorage, PlayRecord, SkipConfig } from './types';
 
 // 搜索历史最大条数
@@ -159,8 +160,8 @@ export class UpstashRedisStorage implements IStorage {
   }
 
   async registerUser(userName: string, password: string): Promise<void> {
-    // 简单存储明文密码，生产环境应加密
-    await withRetry(() => this.client.set(this.userPwdKey(userName), password));
+    const hashed = hashPassword(password);
+    await withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
     // 维护用户集合
     await withRetry(() => this.client.sadd(this.usersSetKey(), userName));
   }
@@ -170,8 +171,14 @@ export class UpstashRedisStorage implements IStorage {
       this.client.get(this.userPwdKey(userName))
     );
     if (stored === null) return false;
-    // 确保比较时都是字符串类型
-    return ensureString(stored) === password;
+    const storedStr = ensureString(stored as any);
+    const ok = verifyPassword(password, storedStr);
+    // 平滑迁移：如果是明文密码且验证通过，自动升级为加盐哈希
+    if (ok && !isHashed(storedStr)) {
+      const hashed = hashPassword(password);
+      await withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
+    }
+    return ok;
   }
 
   // 检查用户是否存在
@@ -185,9 +192,9 @@ export class UpstashRedisStorage implements IStorage {
 
   // 修改用户密码
   async changePassword(userName: string, newPassword: string): Promise<void> {
-    // 简单存储明文密码，生产环境应加密
+    const hashed = hashPassword(newPassword);
     await withRetry(() =>
-      this.client.set(this.userPwdKey(userName), newPassword)
+      this.client.set(this.userPwdKey(userName), hashed)
     );
   }
 
@@ -426,7 +433,7 @@ export class UpstashRedisStorage implements IStorage {
           })
           .filter((u): u is string => typeof u === 'string');
         if (userNames.length > 0) {
-          await withRetry(() => this.client.sadd(this.usersSetKey(), ...userNames));
+          await withRetry(() => this.client.sadd(this.usersSetKey(), userNames));
           console.log(`迁移了 ${userNames.length} 个用户到 Set`);
         }
       }
@@ -436,6 +443,40 @@ export class UpstashRedisStorage implements IStorage {
       console.log('数据迁移完成');
     } catch (error) {
       console.error('数据迁移失败:', error);
+    }
+  }
+
+  // ---------- 密码迁移：明文 → 加盐哈希 ----------
+  private pwdMigrationKey() {
+    return 'sys:migration:pwd_hash_v1';
+  }
+
+  async migratePasswords(): Promise<void> {
+    const migrated = await withRetry(() => this.client.get(this.pwdMigrationKey()));
+    if (migrated === 'done') return;
+
+    console.log('开始密码迁移：明文 → 加盐哈希...');
+
+    try {
+      const pwdKeys: string[] = await withRetry(() => this.client.keys('u:*:pwd'));
+      let count = 0;
+
+      for (const key of pwdKeys) {
+        const stored = await withRetry(() => this.client.get(key));
+        if (stored === null) continue;
+        const storedStr = ensureString(stored as any);
+        // 跳过已经是哈希格式的
+        if (isHashed(storedStr)) continue;
+        // 将明文密码转为加盐哈希
+        const hashed = hashPassword(storedStr);
+        await withRetry(() => this.client.set(key, hashed));
+        count++;
+      }
+
+      await withRetry(() => this.client.set(this.pwdMigrationKey(), 'done'));
+      console.log(`密码迁移完成，共迁移 ${count} 个用户`);
+    } catch (error) {
+      console.error('密码迁移失败:', error);
     }
   }
 

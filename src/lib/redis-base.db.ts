@@ -3,6 +3,7 @@
 import { createClient, RedisClientType } from 'redis';
 
 import { AdminConfig } from './admin.types';
+import { hashPassword, isHashed, verifyPassword } from './password';
 import { Favorite, IStorage, PlayRecord, SkipConfig } from './types';
 
 // 搜索历史最大条数
@@ -251,8 +252,8 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   async registerUser(userName: string, password: string): Promise<void> {
-    // 简单存储明文密码，生产环境应加密
-    await this.withRetry(() => this.client.set(this.userPwdKey(userName), password));
+    const hashed = hashPassword(password);
+    await this.withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
     // 维护用户集合
     await this.withRetry(() => this.client.sAdd(this.usersSetKey(), userName));
   }
@@ -262,8 +263,14 @@ export abstract class BaseRedisStorage implements IStorage {
       this.client.get(this.userPwdKey(userName))
     );
     if (stored === null) return false;
-    // 确保比较时都是字符串类型
-    return ensureString(stored) === password;
+    const storedStr = ensureString(stored);
+    const ok = verifyPassword(password, storedStr);
+    // 平滑迁移：如果是明文密码且验证通过，自动升级为加盐哈希
+    if (ok && !isHashed(storedStr)) {
+      const hashed = hashPassword(password);
+      await this.withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
+    }
+    return ok;
   }
 
   // 检查用户是否存在
@@ -277,9 +284,9 @@ export abstract class BaseRedisStorage implements IStorage {
 
   // 修改用户密码
   async changePassword(userName: string, newPassword: string): Promise<void> {
-    // 简单存储明文密码，生产环境应加密
+    const hashed = hashPassword(newPassword);
     await this.withRetry(() =>
-      this.client.set(this.userPwdKey(userName), newPassword)
+      this.client.set(this.userPwdKey(userName), hashed)
     );
   }
 
@@ -531,6 +538,40 @@ export abstract class BaseRedisStorage implements IStorage {
       console.log('数据迁移完成');
     } catch (error) {
       console.error('数据迁移失败:', error);
+    }
+  }
+
+  // ---------- 密码迁移：明文 → 加盐哈希 ----------
+  private pwdMigrationKey() {
+    return 'sys:migration:pwd_hash_v1';
+  }
+
+  async migratePasswords(): Promise<void> {
+    const migrated = await this.withRetry(() => this.client.get(this.pwdMigrationKey()));
+    if (migrated === 'done') return;
+
+    console.log('开始密码迁移：明文 → 加盐哈希...');
+
+    try {
+      const pwdKeys = await this.withRetry(() => this.client.keys('u:*:pwd'));
+      let count = 0;
+
+      for (const key of pwdKeys) {
+        const stored = await this.withRetry(() => this.client.get(key));
+        if (stored === null) continue;
+        const storedStr = ensureString(stored);
+        // 跳过已经是哈希格式的
+        if (isHashed(storedStr)) continue;
+        // 将明文密码转为加盐哈希
+        const hashed = hashPassword(storedStr);
+        await this.withRetry(() => this.client.set(key, hashed));
+        count++;
+      }
+
+      await this.withRetry(() => this.client.set(this.pwdMigrationKey(), 'done'));
+      console.log(`密码迁移完成，共迁移 ${count} 个用户`);
+    } catch (error) {
+      console.error('密码迁移失败:', error);
     }
   }
 
