@@ -48,9 +48,24 @@ export function generateStorageKey(source: string, id: string): string {
 // 导出便捷方法
 export class DbManager {
   private storage: IStorage;
+  private migrationPromise: Promise<void> | null = null;
 
   constructor() {
     this.storage = getStorage();
+    // 启动时自动触发数据迁移（异步，不阻塞构造）
+    if (this.storage && typeof this.storage.migrateData === 'function') {
+      this.migrationPromise = this.storage.migrateData().catch((err) => {
+        console.error('数据迁移异常:', err);
+      });
+    }
+  }
+
+  /** 等待迁移完成（内部方法，首次调用后 migrationPromise 会被置空） */
+  private async ensureMigrated(): Promise<void> {
+    if (this.migrationPromise) {
+      await this.migrationPromise;
+      this.migrationPromise = null;
+    }
   }
 
   // 播放记录相关方法
@@ -76,6 +91,7 @@ export class DbManager {
   async getAllPlayRecords(userName: string): Promise<{
     [key: string]: PlayRecord;
   }> {
+    await this.ensureMigrated();
     return this.storage.getAllPlayRecords(userName);
   }
 
@@ -86,6 +102,10 @@ export class DbManager {
   ): Promise<void> {
     const key = generateStorageKey(source, id);
     await this.storage.deletePlayRecord(userName, key);
+  }
+
+  async deleteAllPlayRecords(userName: string): Promise<void> {
+    await this.storage.deleteAllPlayRecords(userName);
   }
 
   // 收藏相关方法
@@ -111,6 +131,7 @@ export class DbManager {
   async getAllFavorites(
     userName: string
   ): Promise<{ [key: string]: Favorite }> {
+    await this.ensureMigrated();
     return this.storage.getAllFavorites(userName);
   }
 
@@ -121,6 +142,10 @@ export class DbManager {
   ): Promise<void> {
     const key = generateStorageKey(source, id);
     await this.storage.deleteFavorite(userName, key);
+  }
+
+  async deleteAllFavorites(userName: string): Promise<void> {
+    await this.storage.deleteAllFavorites(userName);
   }
 
   async isFavorited(

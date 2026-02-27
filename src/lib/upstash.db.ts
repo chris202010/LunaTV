@@ -61,8 +61,8 @@ export class UpstashRedisStorage implements IStorage {
   }
 
   // ---------- 播放记录 ----------
-  private prKey(user: string, key: string) {
-    return `u:${user}:pr:${key}`; // u:username:pr:source+id
+  private prHashKey(user: string) {
+    return `u:${user}:pr`; // 一个用户的所有播放记录存在一个 Hash 中
   }
 
   async getPlayRecord(
@@ -70,7 +70,7 @@ export class UpstashRedisStorage implements IStorage {
     key: string
   ): Promise<PlayRecord | null> {
     const val = await withRetry(() =>
-      this.client.get(this.prKey(userName, key))
+      this.client.hget(this.prHashKey(userName), key)
     );
     return val ? (val as PlayRecord) : null;
   }
@@ -80,40 +80,43 @@ export class UpstashRedisStorage implements IStorage {
     key: string,
     record: PlayRecord
   ): Promise<void> {
-    await withRetry(() => this.client.set(this.prKey(userName, key), record));
+    await withRetry(() =>
+      this.client.hset(this.prHashKey(userName), { [key]: record })
+    );
   }
 
   async getAllPlayRecords(
     userName: string
   ): Promise<Record<string, PlayRecord>> {
-    const pattern = `u:${userName}:pr:*`;
-    const keys: string[] = await withRetry(() => this.client.keys(pattern));
-    if (keys.length === 0) return {};
-
+    const all = await withRetry(() =>
+      this.client.hgetall(this.prHashKey(userName))
+    );
+    if (!all || Object.keys(all).length === 0) return {};
     const result: Record<string, PlayRecord> = {};
-    for (const fullKey of keys) {
-      const value = await withRetry(() => this.client.get(fullKey));
+    for (const [field, value] of Object.entries(all)) {
       if (value) {
-        // 截取 source+id 部分
-        const keyPart = ensureString(fullKey.replace(`u:${userName}:pr:`, ''));
-        result[keyPart] = value as PlayRecord;
+        result[field] = value as PlayRecord;
       }
     }
     return result;
   }
 
   async deletePlayRecord(userName: string, key: string): Promise<void> {
-    await withRetry(() => this.client.del(this.prKey(userName, key)));
+    await withRetry(() => this.client.hdel(this.prHashKey(userName), key));
+  }
+
+  async deleteAllPlayRecords(userName: string): Promise<void> {
+    await withRetry(() => this.client.del(this.prHashKey(userName)));
   }
 
   // ---------- 收藏 ----------
-  private favKey(user: string, key: string) {
-    return `u:${user}:fav:${key}`;
+  private favHashKey(user: string) {
+    return `u:${user}:fav`; // 一个用户的所有收藏存在一个 Hash 中
   }
 
   async getFavorite(userName: string, key: string): Promise<Favorite | null> {
     const val = await withRetry(() =>
-      this.client.get(this.favKey(userName, key))
+      this.client.hget(this.favHashKey(userName), key)
     );
     return val ? (val as Favorite) : null;
   }
@@ -124,28 +127,30 @@ export class UpstashRedisStorage implements IStorage {
     favorite: Favorite
   ): Promise<void> {
     await withRetry(() =>
-      this.client.set(this.favKey(userName, key), favorite)
+      this.client.hset(this.favHashKey(userName), { [key]: favorite })
     );
   }
 
   async getAllFavorites(userName: string): Promise<Record<string, Favorite>> {
-    const pattern = `u:${userName}:fav:*`;
-    const keys: string[] = await withRetry(() => this.client.keys(pattern));
-    if (keys.length === 0) return {};
-
+    const all = await withRetry(() =>
+      this.client.hgetall(this.favHashKey(userName))
+    );
+    if (!all || Object.keys(all).length === 0) return {};
     const result: Record<string, Favorite> = {};
-    for (const fullKey of keys) {
-      const value = await withRetry(() => this.client.get(fullKey));
+    for (const [field, value] of Object.entries(all)) {
       if (value) {
-        const keyPart = ensureString(fullKey.replace(`u:${userName}:fav:`, ''));
-        result[keyPart] = value as Favorite;
+        result[field] = value as Favorite;
       }
     }
     return result;
   }
 
   async deleteFavorite(userName: string, key: string): Promise<void> {
-    await withRetry(() => this.client.del(this.favKey(userName, key)));
+    await withRetry(() => this.client.hdel(this.favHashKey(userName), key));
+  }
+
+  async deleteAllFavorites(userName: string): Promise<void> {
+    await withRetry(() => this.client.del(this.favHashKey(userName)));
   }
 
   // ---------- 用户注册 / 登录 ----------
@@ -192,23 +197,11 @@ export class UpstashRedisStorage implements IStorage {
     // 删除搜索历史
     await withRetry(() => this.client.del(this.shKey(userName)));
 
-    // 删除播放记录
-    const playRecordPattern = `u:${userName}:pr:*`;
-    const playRecordKeys = await withRetry(() =>
-      this.client.keys(playRecordPattern)
-    );
-    if (playRecordKeys.length > 0) {
-      await withRetry(() => this.client.del(...playRecordKeys));
-    }
+    // 删除播放记录（Hash key 直接删除）
+    await withRetry(() => this.client.del(this.prHashKey(userName)));
 
-    // 删除收藏夹
-    const favoritePattern = `u:${userName}:fav:*`;
-    const favoriteKeys = await withRetry(() =>
-      this.client.keys(favoritePattern)
-    );
-    if (favoriteKeys.length > 0) {
-      await withRetry(() => this.client.del(...favoriteKeys));
-    }
+    // 删除收藏夹（Hash key 直接删除）
+    await withRetry(() => this.client.del(this.favHashKey(userName)));
 
     // 删除跳过片头片尾配置
     const skipConfigPattern = `u:${userName}:skip:*`;
@@ -342,6 +335,77 @@ export class UpstashRedisStorage implements IStorage {
     });
 
     return configs;
+  }
+
+  // ---------- 数据迁移：旧扁平 key → Hash 结构 ----------
+  private migrationKey() {
+    return 'sys:migration:hash_v1';
+  }
+
+  async migrateData(): Promise<void> {
+    // 检查是否已迁移
+    const migrated = await withRetry(() => this.client.get(this.migrationKey()));
+    if (migrated === 'done') return;
+
+    console.log('开始数据迁移：扁平 key → Hash 结构...');
+
+    try {
+      // 迁移播放记录：u:*:pr:* → u:username:pr (Hash)
+      const prKeys: string[] = await withRetry(() => this.client.keys('u:*:pr:*'));
+      if (prKeys.length > 0) {
+        const oldPrKeys = prKeys.filter((k) => {
+          const parts = k.split(':');
+          return parts.length >= 4 && parts[2] === 'pr' && parts[3] !== '';
+        });
+
+        for (const oldKey of oldPrKeys) {
+          const match = oldKey.match(/^u:(.+?):pr:(.+)$/);
+          if (!match) continue;
+          const [, userName, field] = match;
+          const value = await withRetry(() => this.client.get(oldKey));
+          if (value) {
+            await withRetry(() =>
+              this.client.hset(this.prHashKey(userName), { [field]: value })
+            );
+            await withRetry(() => this.client.del(oldKey));
+          }
+        }
+        if (oldPrKeys.length > 0) {
+          console.log(`迁移了 ${oldPrKeys.length} 条播放记录`);
+        }
+      }
+
+      // 迁移收藏：u:*:fav:* → u:username:fav (Hash)
+      const favKeys: string[] = await withRetry(() => this.client.keys('u:*:fav:*'));
+      if (favKeys.length > 0) {
+        const oldFavKeys = favKeys.filter((k) => {
+          const parts = k.split(':');
+          return parts.length >= 4 && parts[2] === 'fav' && parts[3] !== '';
+        });
+
+        for (const oldKey of oldFavKeys) {
+          const match = oldKey.match(/^u:(.+?):fav:(.+)$/);
+          if (!match) continue;
+          const [, userName, field] = match;
+          const value = await withRetry(() => this.client.get(oldKey));
+          if (value) {
+            await withRetry(() =>
+              this.client.hset(this.favHashKey(userName), { [field]: value })
+            );
+            await withRetry(() => this.client.del(oldKey));
+          }
+        }
+        if (oldFavKeys.length > 0) {
+          console.log(`迁移了 ${oldFavKeys.length} 条收藏`);
+        }
+      }
+
+      // 标记迁移完成
+      await withRetry(() => this.client.set(this.migrationKey(), 'done'));
+      console.log('数据迁移完成');
+    } catch (error) {
+      console.error('数据迁移失败:', error);
+    }
   }
 
   // 清空所有数据
