@@ -85,8 +85,8 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ghcr.io/moontechlab/lunatv:${{ steps.docker-tag.outputs.tag }}
-          outputs: type=image,name=ghcr.io/moontechlab/lunatv,name-canonical=true,push=true
+          tags: ghcr.io/chris202010/lunatv:${{ steps.docker-tag.outputs.tag }}
+          outputs: type=image,name=ghcr.io/chris202010/lunatv,name-canonical=true,push=true
 
       - name: Export digest
         run: |
